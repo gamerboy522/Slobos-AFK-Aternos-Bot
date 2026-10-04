@@ -1,118 +1,90 @@
-function randomMs(minMs, maxMs) {
-    return Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs
+const net = require('net');
+const settings = require('./settings.json');
+
+let reconnectAttempts = 0;
+const baseDelay = settings.utils?.['auto-reconnect-delay'] || 5000;
+const maxDelay = settings.utils?.['max-reconnect-delay'] || 120000;
+const maxAttempts = settings.utils?.['max-reconnect-attempts'] || 20;
+
+// Exponential backoff + random jitter to prevent sync-spam
+function getDelay() {
+  const exp = baseDelay * Math.pow(2, reconnectAttempts);
+  const capped = Math.min(exp, maxDelay);
+  return capped + Math.floor(Math.random() * 2000);
 }
 
-function setupLeaveRejoin(bot, createBot) {
-    // Timers
-    let leaveTimer = null
-    let jumpTimer = null
-    let jumpOffTimer = null
-    let reconnectTimer = null
-
-    // State
-    let stopped = false
-    let reconnectAttempts = 0
-    let lastLogAt = 0
-
-    function logThrottled(msg, minGapMs = 2000) {
-        const now = Date.now()
-        if (now - lastLogAt >= minGapMs) {
-            lastLogAt = now
-            console.log(msg)
-        }
-    }
-
-    function cleanup() {
-        stopped = true
-        if (leaveTimer) clearTimeout(leaveTimer)
-        if (jumpTimer) clearTimeout(jumpTimer)
-        if (jumpOffTimer) clearTimeout(jumpOffTimer)
-        if (reconnectTimer) clearTimeout(reconnectTimer)
-        leaveTimer = jumpTimer = jumpOffTimer = reconnectTimer = null
-    }
-
-    function scheduleNextJump() {
-        if (stopped || !bot.entity) return
-
-        bot.setControlState('jump', true)
-        jumpOffTimer = setTimeout(() => {
-            bot.setControlState('jump', false)
-        }, 300)
-
-        // random jump 20s -> 5m
-        const nextJump = randomMs(20000, 5 * 60 * 1000)
-        jumpTimer = setTimeout(scheduleNextJump, nextJump)
-    }
-
-    function scheduleReconnect(reason = 'end') {
-        if (stopped) return
-
-        // FAST RECONNECT: 2s -> 10s (User requested faster)
-        let delay = randomMs(2000, 10000)
-
-        // Slight backoff for repeated failures, but keep it snappy
-        reconnectAttempts++
-        if (reconnectAttempts > 3) {
-            delay += 5000 // Add 5s if it's failing a lot
-        }
-
-        // Cap at 30s max
-        delay = Math.min(delay, 15000)
-
-        logThrottled(`[AFK] Rejoin scheduled in ${Math.round(delay / 1000)}s (reason: ${reason}, attempt: ${reconnectAttempts})`)
-
-        reconnectTimer = setTimeout(() => {
-            if (stopped) return
-            try {
-                if (typeof createBot === 'function') createBot()
-            } catch (e) {
-                console.log('[AFK] createBot error:', e?.message || e)
-                scheduleReconnect('createBot-error')
-            }
-        }, delay)
-    }
-
-    bot.once('spawn', () => {
-        // reset attempt counter on successful connect
-        reconnectAttempts = 0
-
-        // clear any old timers
-        cleanup()
-        stopped = false
-
-        // Stay connected: 2 minutes -> 15 minutes (More realistic AFK behavior)
-        // Stay connected 1-5 minutes before a scheduled leave/rejoin cycle.
-        const stayTime = randomMs(60000, 300000)
-
-        logThrottled(`[AFK] Will leave in ${Math.round(stayTime / 1000)} seconds`)
-
-        scheduleNextJump()
-
-        leaveTimer = setTimeout(() => {
-            if (stopped) return
-            logThrottled('[AFK] Leaving server (timer)')
-            cleanup()
-            try {
-                bot.quit()
-            } catch (e) {
-                // ignore if already closed
-            }
-        }, stayTime)
-    })
-
-    // When the connection ends for ANY reason, just clean up our timers.
-    // Reconnection is handled by index.js — no duplicate reconnect here.
-    bot.on('end', () => {
-        cleanup()
-    })
-
-    bot.on('kicked', () => {
-        cleanup()
-    })
-
-    bot.on('error', () => {
-        cleanup()
-    })
+// Don't retry on permanent/server-enforced disconnects
+function shouldReconnect(reason) {
+  const r = String(reason).toLowerCase();
+  const blocklist = [
+    'banned', 'kicked', 'invalid session', 'authentication',
+    'outdated client', 'outdated server', 'whitelist', 'full',
+    'logged in from another location', 'illegal characters'
+  ];
+  return !blocklist.some(k => r.includes(k));
 }
 
-module.exports = setupLeaveRejoin
+// Clean teardown to prevent memory leaks & ghost listeners
+function cleanupBot(bot) {
+  if (!bot) return;
+  bot.removeAllListeners();
+  try { bot.end('reconnecting'); } catch {}
+}
+
+// Lightweight TCP ping to wait for Aternos boot without extra dependencies
+function waitForServer(host, port, timeout = 180000) {
+  return new Promise(resolve => {
+    const start = Date.now();
+    const check = () => {
+      if (Date.now() - start > timeout) return resolve(false);
+      const socket = new net.Socket();
+      socket.setTimeout(3000);
+      socket.on('connect', () => { socket.destroy(); resolve(true); });
+      socket.on('error', () => { socket.destroy(); setTimeout(check, 5000); });
+      socket.connect(port, host);
+    };
+    check();
+  });
+}
+
+module.exports = function setupReconnect(bot, createBotFn) {
+  bot.on('end', async (reason) => {
+    console.log(`🔌 [Reconnect] Disconnected: ${reason}`);
+    
+    if (!shouldReconnect(reason)) {
+      console.log('❌ [Reconnect] Permanent disconnect reason. Stopping retries.');
+      return;
+    }
+
+    if (reconnectAttempts >= maxAttempts) {
+      console.log('❌ [Reconnect] Max attempts reached. Exiting.');
+      process.exit(0);
+    }
+
+    reconnectAttempts++;
+    const delay = getDelay();
+    console.log(`⏳ [Reconnect] Waiting ${Math.round(delay/1000)}s before retry ${reconnectAttempts}/${maxAttempts}...`);
+
+    cleanupBot(bot);
+
+    // Wait for delay, then check if server is actually online (handles Aternos boot time)
+    setTimeout(async () => {
+      console.log('📡 [Reconnect] Pinging server...');
+      const online = await waitForServer(settings.server.ip, settings.server.port, 120000);
+      
+      if (!online) {
+        console.log('⚠️ [Reconnect] Server still offline. Extending wait...');
+        setTimeout(() => createBotFn(), 30000);
+        return;
+      }
+
+      console.log('✅ [Reconnect] Server online. Connecting...');
+      createBotFn();
+    }, delay);
+  });
+
+  bot.on('login', () => {
+    console.log('✅ [Reconnect] Successfully logged in. Resetting attempt counter.');
+    reconnectAttempts = 0;
+  });
+};

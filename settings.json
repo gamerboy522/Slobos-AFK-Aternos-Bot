@@ -6,9 +6,11 @@
     "type": "offline"
   },
   "server": {
-    "ip": "CraftsGen.aternos.me",
-    "port": 23072,
-    "version": "",
+    "ip": "KeviinGaming508.aternos.me:27986",
+    "port": 27986
+
+,
+    "version": "latest",
     "try-creative": false
   },
   "position": {
@@ -29,7 +31,7 @@
     "chat-messages": {
       "enabled": true,
       "repeat": true,
-      "repeat-delay": 120,
+      "repeat-delay": 120000,
       "messages": [
         "I'm a regular player",
         "Subscribe to Slobos!",
